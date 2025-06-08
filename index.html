@@ -77,7 +77,6 @@ const addBusinessDays = (startDate, days) => {
   while (added < days) { d.setDate(d.getDate() + 1); if (!isWeekend(d)) added++; }
   return d;
 };
-
 const calcularStatusPrazo = (dataNotificacaoTimestamp) => {
     if (!dataNotificacaoTimestamp?.toDate) return { texto: "Data Inválida", classeCor: "text-gray-500" };
     const dataNotificacao = dataNotificacaoTimestamp.toDate();
@@ -460,7 +459,7 @@ function UserManagement({ currentUser }) {
             showToast("Utilizador excluído.", "success");
         } catch (error) { showToast("Erro ao excluir utilizador.", "error"); }
     };
-    
+
     return (
       <div className="space-y-8">
         <section className="bg-white p-6 rounded-lg shadow-md">
