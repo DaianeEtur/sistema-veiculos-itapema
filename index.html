@@ -1,605 +1,608 @@
-<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Veículos Itapema - Gerenciamento</title>
+import React, { useState, useEffect, createContext, useContext, useCallback, useMemo } from 'react';
+import { initializeApp } from 'firebase/app';
+import {
+  getAuth,
+  signInAnonymously,
+  onAuthStateChanged,
+  setPersistence,
+  inMemoryPersistence,
+} from 'firebase/auth';
+import {
+  getFirestore,
+  collection,
+  doc,
+  getDoc,
+  setDoc,
+  addDoc,
+  query,
+  where,
+  getDocs,
+  Timestamp,
+  onSnapshot,
+  orderBy,
+  updateDoc,
+  writeBatch,
+  deleteDoc,
+} from 'firebase/firestore';
+import { 
+    AlertTriangle, LogOut, Car, Users, ListChecks, ShieldAlert, 
+    PlusCircle, Search, Clock, Eye, Edit2, Trash2, UserCog, CheckCircle, 
+    XCircle, UserPlus, Printer, FileText
+} from 'lucide-react';
+
+// --- CONFIGURAÇÃO E INICIALIZAÇÃO DO FIREBASE ---
+const firebaseConfigString = typeof __firebase_config !== 'undefined' ? __firebase_config : '{}';
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+let app;
+let auth;
+let db;
+let firebaseInitializationError = null;
+
+try {
+  const parsedConfig = JSON.parse(firebaseConfigString);
+  if (Object.keys(parsedConfig).length > 0 && parsedConfig.apiKey) {
+    app = initializeApp(parsedConfig);
+    auth = getAuth(app);
+    db = getFirestore(app);
+    setPersistence(auth, inMemoryPersistence);
+  } else {
+    firebaseInitializationError = "Configuração do Firebase em falta ou a chave API não está definida.";
+  }
+} catch (error) {
+  firebaseInitializationError = `Erro ao inicializar Firebase: ${error.message}`;
+}
+
+// --- UTILITÁRIOS ---
+const showToast = (message, type = 'info') => {
+    const toastId = 'toast-notification-element';
+    let toast = document.getElementById(toastId);
+    if (!toast) {
+        toast = document.createElement('div');
+        toast.id = toastId;
+        document.body.appendChild(toast);
+    }
+    toast.className = `fixed bottom-5 right-5 p-4 rounded-md shadow-lg text-white text-sm z-[1001] transition-all duration-300 transform translate-y-10 opacity-0`;
+    const colors = { success: 'bg-green-500', error: 'bg-red-500', warning: 'bg-yellow-500', info: 'bg-blue-500' };
+    toast.classList.add(colors[type] || colors.info);
+    toast.textContent = message;
+    setTimeout(() => { toast.classList.remove('translate-y-10', 'opacity-0'); toast.classList.add('translate-y-0', 'opacity-100'); }, 10);
+    setTimeout(() => { toast.classList.remove('translate-y-0', 'opacity-100'); toast.classList.add('translate-y-10', 'opacity-0'); setTimeout(() => { if(document.body.contains(toast)) document.body.removeChild(toast); }, 300); }, 3500);
+};
+
+const addCalendarDays = (startDate, days) => {
+  const date = new Date(startDate.getTime());
+  date.setDate(date.getDate() + days);
+  return date;
+};
+const calcularStatusPrazo = (dataNotificacaoTimestamp) => {
+    if (!dataNotificacaoTimestamp?.toDate) return { texto: "Data Inválida", classeCor: "text-gray-500" };
+    const dataNotificacao = dataNotificacaoTimestamp.toDate();
+    const dataLimite = addCalendarDays(dataNotificacao, 3);
+    const hoje = new Date();
+    hoje.setHours(0, 0, 0, 0); dataLimite.setHours(0,0,0,0);
+    if (hoje > dataLimite) return { texto: "Fora do prazo", classeCor: "text-red-600 font-semibold" };
+    const diffTime = Math.max(0, dataLimite - hoje);
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    return { texto: `Em prazo (${diffDays} dia(s))`, classeCor: "text-green-600 font-semibold" };
+};
+const logAction = async (action, details, author) => {
+    if (!db || !author) return;
+    try {
+        const logsCollectionRef = collection(db, `artifacts/${appId}/public/data/audit_logs`);
+        await addDoc(logsCollectionRef, { action, details, author: { matricula: author.matricula, nome: author.nome }, timestamp: Timestamp.now() });
+    } catch (error) { console.error("Erro ao registar log:", error); }
+};
+
+// --- CONTEXTO DE AUTENTICAÇÃO ---
+const AuthContext = createContext(null);
+export const useAuth = () => useContext(AuthContext);
+
+export function AuthProvider({ children }) {
+  const [currentUser, setCurrentUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [authError, setAuthError] = useState('');
+
+  const criarUtilizadoresIniciaisSeNaoExistirem = useCallback(async () => {
+    if (!db) return;
+    const usersCollectionRef = collection(db, `artifacts/${appId}/public/data/users`);
+    const usersToSeed = [
+        { id: '12937', data: { matricula: '12937', senha: '!@12ASdf', nome: 'Administrador Principal', tipo: 'Administrador', aprovado: true } },
+        { id: '11111', data: { matricula: '11111', senha: 'padrao123', nome: 'Utilizador Padrão', tipo: 'Padrão', aprovado: true } },
+        { id: '22222', data: { matricula: '22222', senha: 'consulta123', nome: 'Utilizador Consulta', tipo: 'Consulta', aprovado: true } }
+    ];
+    try {
+        const docRefs = usersToSeed.map(user => doc(usersCollectionRef, user.id));
+        const docSnaps = await Promise.all(docRefs.map(ref => getDoc(ref)));
+        const batch = writeBatch(db);
+        let hasWritten = false;
+        docSnaps.forEach((docSnap, index) => {
+            if (!docSnap.exists()) {
+                const user = usersToSeed[index];
+                batch.set(docSnap.ref, { ...user.data, dataCriacao: Timestamp.now() });
+                hasWritten = true;
+            }
+        });
+        if (hasWritten) {
+            await batch.commit();
+            showToast("Utilizadores iniciais configurados com sucesso!", "success");
+        }
+    } catch (error) { setAuthError("Falha ao configurar utilizadores iniciais."); }
+  }, []);
+
+  useEffect(() => {
+    if (!auth) { setLoading(false); return; }
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (user) await criarUtilizadoresIniciaisSeNaoExistirem();
+      else { try { await signInAnonymously(auth); } catch (error) { setAuthError("Falha ao estabelecer sessão segura."); } }
+      setLoading(false);
+    });
+    return () => unsubscribe();
+  }, [criarUtilizadoresIniciaisSeNaoExistirem]);
+
+  const login = async (matricula, senha) => {
+    if (!db) { setAuthError("A base de dados não está disponível."); return; }
+    setLoading(true); setAuthError('');
+    try {
+      const userDocRef = doc(db, `artifacts/${appId}/public/data/users`, matricula);
+      const userDocSnap = await getDoc(userDocRef);
+      if (userDocSnap.exists()) {
+        const userData = userDocSnap.data();
+        if (userData.senha === senha) {
+          if (!userData.aprovado) setAuthError('Utilizador aguardando aprovação.');
+          else setCurrentUser({ uid: userDocSnap.id, ...userData });
+        } else setAuthError('Senha incorreta.');
+      } else setAuthError('Matrícula não encontrada.');
+    } catch (error) { setAuthError('Ocorreu um erro durante o login.'); } 
+    finally { setLoading(false); }
+  };
+
+  const logout = () => setCurrentUser(null);
+  const value = { currentUser, loading, authError, login, logout, setAuthError, criarUtilizadoresIniciaisSeNaoExistirem };
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}
+
+// --- COMPONENTES ---
+
+function ErrorScreen({ message, details }) {
+    return ( <div className="min-h-screen flex flex-col items-center justify-center bg-red-50 p-4 text-red-800"> <ShieldAlert size={48} className="mb-4" /> <h1 className="text-2xl font-bold mb-2">{message}</h1> <p className="text-center max-w-lg">{details}</p> </div> );
+}
+function LoadingScreen({ message = "A carregar..." }) {
+    return ( <div className="min-h-screen flex items-center justify-center bg-gray-100"> <div className="flex items-center space-x-3"> <svg className="animate-spin h-6 w-6 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> <p className="text-lg text-gray-600">{message}</p> </div> </div> );
+}
+
+function LoginPage() {
+  const [matricula, setMatricula] = useState('');
+  const [senha, setSenha] = useState('');
+  const { login, loading, authError, setAuthError } = useAuth();
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setAuthError('');
+    if (!matricula || !senha) { setAuthError('Matrícula e senha são obrigatórios.'); return; }
+    if (matricula.length !== 5 || !/^\d+$/.test(matricula)) { setAuthError('Matrícula deve ter 5 dígitos numéricos.'); return; }
+    await login(matricula, senha);
+  };
+  return (
+    <div className="min-h-screen flex flex-col items-center justify-center bg-gray-100 p-4">
+      <div className="w-full max-w-md bg-white p-8 rounded-xl shadow-2xl">
+        <div className="text-center mb-8"><Car size={48} className="mx-auto text-blue-600 mb-3" /><h1 className="text-3xl font-bold text-gray-800">Veículos Itapema</h1><p className="text-gray-600 mt-1">Gerenciamento de Veículos Abandonados</p></div>
+        {authError && (<div className="mb-4 p-3 rounded-md bg-red-100 text-red-700 text-sm flex items-center"><AlertTriangle size={20} className="mr-2 flex-shrink-0" /><span>{authError}</span></div>)}
+        <form onSubmit={handleSubmit} className="space-y-6">
+          <div><label htmlFor="matricula" className="block text-sm font-medium text-gray-700">Matrícula</label><input type="text" id="matricula" value={matricula} onChange={(e) => { const val = e.target.value; if (/^\d*$/.test(val) && val.length <= 5) setMatricula(val);}} required className="mt-1 block w-full px-4 py-3 border border-gray-300 rounded-lg shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500" placeholder="5 dígitos numéricos" /></div>
+          <div><label htmlFor="senha" className="block text-sm font-medium text-gray-700">Senha</label><input type="password" id="senha" value={senha} onChange={(e) => setSenha(e.target.value)} required className="mt-1 block w-full px-4 py-3 border border-gray-300 rounded-lg shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500" placeholder="Sua senha" /></div>
+          <button type="submit" disabled={loading} className="w-full flex justify-center py-3 px-4 border border-transparent rounded-lg shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50">{loading ? 'A verificar...' : 'Entrar'}</button>
+        </form>
+      </div>
+      <p className="mt-8 text-xs text-gray-500">&copy; {new Date().getFullYear()} Prefeitura de Itapema.</p>
+    </div>
+  );
+}
+
+// --- COMPONENTES DO DASHBOARD ---
+
+function VehicleManagement({ currentUser }) {
+    const [allVeiculos, setAllVeiculos] = useState([]);
+    const [loadingVeiculos, setLoadingVeiculos] = useState(true);
+    const [filtroStatus, setFiltroStatus] = useState('Todos');
+    const [searchTerm, setSearchTerm] = useState('');
+    const [formState, setFormState] = useState({ placa: '', marcaModelo: '', cor: '', agente: '', endereco: '', numero: '', bairro: '', referencia: '', dataNotificacao: new Date().toISOString().split('T')[0], status: 'aguardando remoção', observacoes: '' });
+    const [modalData, setModalData] = useState({ vehicle: null, mode: 'view' });
+
+    const handleFormChange = (e) => {
+        const { name, value } = e.target;
+        setFormState(prev => ({ ...prev, [name]: value }));
+    };
     
-    <script src="https://cdn.tailwindcss.com"></script>
-    
-    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
-    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    
-    <script src="https://unpkg.com/lucide-react@0.292.0/dist/lucide-react.js"></script>
+    const handleEditFormChange = (e) => {
+        const { name, value } = e.target;
+        setModalData(prev => ({ ...prev, vehicle: { ...prev.vehicle, [name]: value }}));
+    };
 
-    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-auth.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-firestore.js"></script>
-
-</head>
-<body>
-    <div id="root"></div>
-
-    <script type="text/babel">
-        // --- DESESTRUTURAÇÃO DE HOOKS E LIBS GLOBAIS ---
-        const { useState, useEffect, createContext, useContext, useCallback, useMemo } = React;
-        const { AlertTriangle, LogOut, Car, Users, ListChecks, ShieldAlert, PlusCircle, Search, Clock, Eye, Edit2, Trash2, UserCog, CheckCircle, XCircle, UserPlus, Printer, FileText } = lucide;
-
-        // --- CONFIGURAÇÃO E INICIALIZAÇÃO DO FIREBASE ---
-        const firebaseConfigString = typeof __firebase_config !== 'undefined' ? __firebase_config : '{}';
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-
-        let app;
-        let auth;
-        let db;
-        let firebaseInitializationError = null;
+    const handleCadastroVeiculo = async (e) => {
+        e.preventDefault();
+        const { placa, marcaModelo, cor, agente, endereco, dataNotificacao } = formState;
+        if (!placa || !marcaModelo || !cor || !agente || !endereco || !dataNotificacao) { showToast("Placa, Marca/Modelo, Cor, Agente, Endereço e Data são obrigatórios.", "error"); return; }
+        
+        const veiculosRef = collection(db, `artifacts/${appId}/public/data/veiculos_abandonados_itapema`);
+        const qPlaca = query(veiculosRef, where("placa", "==", placa.toUpperCase()));
+        const placaSnapshot = await getDocs(qPlaca);
+        const denunciaAtiva = placaSnapshot.docs.some(doc => doc.data().status !== 'removido pelo proprietário');
+        if (denunciaAtiva) {
+            showToast(`A placa ${placa.toUpperCase()} já possui uma denúncia ativa.`, "warning"); return;
+        }
 
         try {
-            const parsedConfig = JSON.parse(firebaseConfigString);
-            if (Object.keys(parsedConfig).length > 0 && parsedConfig.apiKey) {
-                app = firebase.initializeApp(parsedConfig);
-                auth = firebase.auth();
-                db = firebase.firestore();
-            } else {
-                firebaseInitializationError = "Configuração do Firebase em falta ou a chave API não está definida.";
-            }
-        } catch (error) {
-            firebaseInitializationError = `Erro ao inicializar Firebase: ${error.message}`;
-        }
+            const novoVeiculoData = { ...formState, placa: placa.toUpperCase(), dataNotificacao: Timestamp.fromDate(new Date(dataNotificacao + "T12:00:00Z")), matriculaAgenteSistema: currentUser.matricula, nomeAgenteSistema: currentUser.nome, dataRegistro: Timestamp.now() };
+            await addDoc(veiculosRef, novoVeiculoData);
+            await logAction("VEÍCULO CRIADO", `Placa: ${novoVeiculoData.placa}`, currentUser);
+            showToast("Veículo cadastrado com sucesso!", "success");
+            setFormState({ placa: '', marcaModelo: '', cor: '', agente: '', endereco: '', numero: '', bairro: '', referencia: '', dataNotificacao: new Date().toISOString().split('T')[0], status: 'aguardando remoção', observacoes: '' });
+        } catch (error) { showToast("Erro ao cadastrar veículo.", "error"); }
+    };
+
+    const handleUpdateVehicle = async (e) => {
+        e.preventDefault();
+        if (!modalData.vehicle) return;
+        const { id, ...dataToUpdate } = modalData.vehicle;
+        const vehicleDocRef = doc(db, `artifacts/${appId}/public/data/veiculos_abandonados_itapema`, id);
+        try {
+            await updateDoc(vehicleDocRef, { ...dataToUpdate, dataNotificacao: Timestamp.fromDate(new Date(dataToUpdate.dataNotificacao)) });
+            await logAction("VEÍCULO ATUALIZADO", `Placa: ${dataToUpdate.placa}`, currentUser);
+            showToast("Veículo atualizado com sucesso!", "success");
+            setModalData({ vehicle: null, mode: 'view' });
+        } catch (error) { showToast("Erro ao atualizar veículo.", "error"); }
+    };
+    
+    useEffect(() => {
+        if (!db) return;
+        const veiculosRef = collection(db, `artifacts/${appId}/public/data/veiculos_abandonados_itapema`);
+        const q = query(veiculosRef, orderBy('dataNotificacao', 'desc'));
         
-        // --- UTILITÁRIOS ---
-        const showToast = (message, type = 'info') => {
-            const toastId = 'toast-notification-element';
-            let toast = document.getElementById(toastId);
-            if (!toast) {
-                toast = document.createElement('div');
-                toast.id = toastId;
-                document.body.appendChild(toast);
-            }
-            toast.className = `fixed bottom-5 right-5 p-4 rounded-md shadow-lg text-white text-sm z-[1001] transition-all duration-300 transform translate-y-10 opacity-0`;
-            const colors = { success: 'bg-green-500', error: 'bg-red-500', warning: 'bg-yellow-500', info: 'bg-blue-500' };
-            toast.classList.add(colors[type] || colors.info);
-            toast.textContent = message;
-            setTimeout(() => { toast.classList.remove('translate-y-10', 'opacity-0'); toast.classList.add('translate-y-0', 'opacity-100'); }, 10);
-            setTimeout(() => { toast.classList.remove('translate-y-0', 'opacity-100'); toast.classList.add('translate-y-10', 'opacity-0'); setTimeout(() => { if(document.body.contains(toast)) document.body.removeChild(toast); }, 300); }, 3500);
-        };
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const veiculosData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setAllVeiculos(veiculosData);
+            setLoadingVeiculos(false);
+        }, () => { showToast("Erro ao carregar lista de veículos.", "error"); setLoadingVeiculos(false); });
+        return () => unsubscribe();
+    }, []);
 
-        const addCalendarDays = (startDate, days) => {
-          const date = new Date(startDate.getTime());
-          date.setDate(date.getDate() + days);
-          return date;
-        };
-        const calcularStatusPrazo = (dataNotificacaoTimestamp) => {
-            if (!dataNotificacaoTimestamp?.toDate) return { texto: "Data Inválida", classeCor: "text-gray-500" };
-            const dataNotificacao = dataNotificacaoTimestamp.toDate();
-            const dataLimite = addCalendarDays(dataNotificacao, 3);
-            const hoje = new Date();
-            hoje.setHours(0, 0, 0, 0); dataLimite.setHours(0,0,0,0);
-            if (hoje > dataLimite) return { texto: "Fora do prazo", classeCor: "text-red-600 font-semibold" };
-            const diffTime = Math.max(0, dataLimite - hoje);
-            const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-            return { texto: `Em prazo (${diffDays} dia(s))`, classeCor: "text-green-600 font-semibold" };
-        };
-        const logAction = async (action, details, author) => {
-            if (!db || !author) return;
-            try {
-                const logsCollectionRef = db.collection(`artifacts/${appId}/public/data/audit_logs`);
-                await logsCollectionRef.add({ action, details, author: { matricula: author.matricula, nome: author.nome }, timestamp: firebase.firestore.FieldValue.serverTimestamp() });
-            } catch (error) { console.error("Erro ao registar log:", error); }
-        };
+    const veiculosFiltrados = useMemo(() => {
+        return allVeiculos.filter(v => {
+            const statusMatch = filtroStatus === 'Todos' || v.status === filtroStatus;
+            const searchMatch = !searchTerm || (v.placa && v.placa.toLowerCase().includes(searchTerm.toLowerCase()));
+            return statusMatch && searchMatch;
+        });
+    }, [allVeiculos, filtroStatus, searchTerm]);
+    
+    const handleDeleteVehicle = async (vehicleId, vehiclePlaca) => {
+        const vehicleDocRef = doc(db, `artifacts/${appId}/public/data/veiculos_abandonados_itapema`, vehicleId);
+        try {
+            await deleteDoc(vehicleDocRef);
+            await logAction("VEÍCULO EXCLUÍDO", `Placa: ${vehiclePlaca}`, currentUser);
+            showToast("Veículo excluído com sucesso.", "success");
+        } catch (error) { showToast("Erro ao excluir veículo.", "error"); }
+    };
 
-        // --- CONTEXTO DE AUTENTICAÇÃO ---
-        const AuthContext = createContext(null);
-        const useAuth = () => useContext(AuthContext);
+    const handlePrint = () => {
+        const printWindow = window.open('', '_blank');
+        const reportTitle = `Relatório de Veículos Abandonados - ${new Date().toLocaleDateString('pt-BR')}`;
+        const filterText = `Filtro aplicado: ${filtroStatus}. Pesquisa: "${searchTerm || 'nenhuma'}".`;
+        let tableContent = '';
+        veiculosFiltrados.forEach(v => {
+            const { texto: prazoTexto } = calcularStatusPrazo(v.dataNotificacao);
+            const enderecoCompleto = `${v.endereco || ''}, ${v.numero || 'S/N'} - ${v.bairro || ''}`;
+            tableContent += `<tr>
+                <td style="border: 1px solid #ddd; padding: 8px;">${v.placa || ''}</td>
+                <td style="border: 1px solid #ddd; padding: 8px;">${v.marcaModelo || ''}</td>
+                <td style="border: 1px solid #ddd; padding: 8px;">${v.agente || ''}</td>
+                <td style="border: 1px solid #ddd; padding: 8px;">${enderecoCompleto}</td>
+                <td style="border: 1px solid #ddd; padding: 8px;">${v.dataNotificacao?.toDate().toLocaleDateString('pt-BR') || ''}</td>
+                <td style="border: 1px solid #ddd; padding: 8px;">${v.status || ''}</td>
+                <td style="border: 1px solid #ddd; padding: 8px;">${prazoTexto}</td>
+            </tr>`;
+        });
+        printWindow.document.write(`<html><head><title>${reportTitle}</title><style>body{font-family:sans-serif;}table{width:100%;border-collapse:collapse;}th,td{border:1px solid #ddd;padding:8px;text-align:left;}th{background-color:#f2f2f2;}@media print{body{-webkit-print-color-adjust:exact;}button{display:none;}}</style></head><body><h2>${reportTitle}</h2><p>${filterText}</p><table><thead><tr><th>Placa</th><th>Marca/Modelo</th><th>Agente</th><th>Endereço</th><th>Data Notificação</th><th>Status</th><th>Prazo</th></tr></thead><tbody>${tableContent}</tbody></table><button onclick="window.print()">Imprimir</button></body></html>`);
+        printWindow.document.close();
+    };
 
-        function AuthProvider({ children }) {
-            const [currentUser, setCurrentUser] = useState(null);
-            const [loading, setLoading] = useState(true);
-            const [authError, setAuthError] = useState('');
-
-            const criarUtilizadoresIniciaisSeNaoExistirem = useCallback(async () => {
-                if (!db) return;
-                const usersCollectionRef = db.collection(`artifacts/${appId}/public/data/users`);
-                const usersToSeed = [
-                    { id: '12937', data: { matricula: '12937', senha: '!@12ASdf', nome: 'Administrador Principal', tipo: 'Administrador', aprovado: true } },
-                    { id: '11111', data: { matricula: '11111', senha: 'padrao123', nome: 'Utilizador Padrão', tipo: 'Padrão', aprovado: true } },
-                    { id: '22222', data: { matricula: '22222', senha: 'consulta123', nome: 'Utilizador Consulta', tipo: 'Consulta', aprovado: true } }
-                ];
-                try {
-                    const batch = db.batch();
-                    let hasWritten = false;
-                    for (const user of usersToSeed) {
-                        const userDocRef = usersCollectionRef.doc(user.id);
-                        const docSnap = await userDocRef.get();
-                        if (!docSnap.exists) {
-                            batch.set(userDocRef, { ...user.data, dataCriacao: firebase.firestore.FieldValue.serverTimestamp() });
-                            hasWritten = true;
-                        }
-                    }
-                    if (hasWritten) {
-                        await batch.commit();
-                        showToast("Utilizadores iniciais configurados com sucesso!", "success");
-                    }
-                } catch (error) { setAuthError("Falha ao configurar utilizadores iniciais."); }
-            }, []);
-
-            useEffect(() => {
-                if (!auth) { setLoading(false); return; }
-                const unsubscribe = auth.onAuthStateChanged(async (user) => {
-                    if (user) {
-                       await auth.setPersistence(firebase.auth.Auth.Persistence.NONE);
-                       await criarUtilizadoresIniciaisSeNaoExistirem();
-                    }
-                    else { try { await auth.signInAnonymously(); } catch (error) { setAuthError("Falha ao estabelecer sessão segura."); } }
-                    setLoading(false);
-                });
-                return () => unsubscribe();
-            }, [criarUtilizadoresIniciaisSeNaoExistirem]);
-
-            const login = async (matricula, senha) => {
-                if (!db) { setAuthError("A base de dados não está disponível."); return; }
-                setLoading(true); setAuthError('');
-                try {
-                    const userDocRef = db.collection(`artifacts/${appId}/public/data/users`).doc(matricula);
-                    const userDocSnap = await userDocRef.get();
-                    if (userDocSnap.exists) {
-                        const userData = userDocSnap.data();
-                        if (userData.senha === senha) {
-                            if (!userData.aprovado) setAuthError('Utilizador aguardando aprovação.');
-                            else setCurrentUser({ uid: userDocSnap.id, ...userData });
-                        } else setAuthError('Senha incorreta.');
-                    } else setAuthError('Matrícula não encontrada.');
-                } catch (error) { setAuthError('Ocorreu um erro durante o login.'); } 
-                finally { setLoading(false); }
-            };
-
-            const logout = () => setCurrentUser(null);
-            const value = { currentUser, loading, authError, login, logout, setAuthError, criarUtilizadoresIniciaisSeNaoExistirem };
-            return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
-        }
-        
-        // --- COMPONENTES ---
-
-        function ErrorScreen({ message, details }) {
-            return ( <div className="min-h-screen flex flex-col items-center justify-center bg-red-50 p-4 text-red-800"> <ShieldAlert size={48} className="mb-4" /> <h1 className="text-2xl font-bold mb-2">{message}</h1> <p className="text-center max-w-lg">{details}</p> </div> );
-        }
-        function LoadingScreen({ message = "A carregar..." }) {
-            return ( <div className="min-h-screen flex items-center justify-center bg-gray-100"> <div className="flex items-center space-x-3"> <svg className="animate-spin h-6 w-6 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> <p className="text-lg text-gray-600">{message}</p> </div> </div> );
-        }
-
-        function LoginPage() {
-          const [matricula, setMatricula] = useState('');
-          const [senha, setSenha] = useState('');
-          const { login, loading, authError, setAuthError } = useAuth();
-          const handleSubmit = async (e) => {
-            e.preventDefault();
-            setAuthError('');
-            if (!matricula || !senha) { setAuthError('Matrícula e senha são obrigatórios.'); return; }
-            if (matricula.length !== 5 || !/^\d+$/.test(matricula)) { setAuthError('Matrícula deve ter 5 dígitos numéricos.'); return; }
-            await login(matricula, senha);
-          };
-          return (
-            <div className="min-h-screen flex flex-col items-center justify-center bg-gray-100 p-4">
-              <div className="w-full max-w-md bg-white p-8 rounded-xl shadow-2xl">
-                <div className="text-center mb-8"><Car size={48} className="mx-auto text-blue-600 mb-3" /><h1 className="text-3xl font-bold text-gray-800">Veículos Itapema</h1><p className="text-gray-600 mt-1">Gerenciamento de Veículos Abandonados</p></div>
-                {authError && (<div className="mb-4 p-3 rounded-md bg-red-100 text-red-700 text-sm flex items-center"><AlertTriangle size={20} className="mr-2 flex-shrink-0" /><span>{authError}</span></div>)}
-                <form onSubmit={handleSubmit} className="space-y-6">
-                  <div><label htmlFor="matricula" className="block text-sm font-medium text-gray-700">Matrícula</label><input type="text" id="matricula" value={matricula} onChange={(e) => { const val = e.target.value; if (/^\d*$/.test(val) && val.length <= 5) setMatricula(val);}} required className="mt-1 block w-full px-4 py-3 border border-gray-300 rounded-lg shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500" placeholder="5 dígitos numéricos" /></div>
-                  <div><label htmlFor="senha" className="block text-sm font-medium text-gray-700">Senha</label><input type="password" id="senha" value={senha} onChange={(e) => setSenha(e.target.value)} required className="mt-1 block w-full px-4 py-3 border border-gray-300 rounded-lg shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500" placeholder="Sua senha" /></div>
-                  <button type="submit" disabled={loading} className="w-full flex justify-center py-3 px-4 border border-transparent rounded-lg shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50">{loading ? 'A verificar...' : 'Entrar'}</button>
+    return (
+        <div className="space-y-8">
+             <section className="bg-white p-6 rounded-lg shadow-md">
+                <h2 className="text-xl font-semibold mb-4 text-gray-800 flex items-center"><PlusCircle className="mr-2" /> Cadastrar Novo Veículo</h2>
+                <form onSubmit={handleCadastroVeiculo} className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                    <div><label className="block text-sm font-medium">Placa</label><input name="placa" value={formState.placa} onChange={handleFormChange} required className="mt-1 p-2 w-full border rounded"/></div>
+                    <div><label className="block text-sm font-medium">Marca/Modelo</label><input name="marcaModelo" value={formState.marcaModelo} onChange={handleFormChange} required className="mt-1 p-2 w-full border rounded"/></div>
+                    <div><label className="block text-sm font-medium">Cor</label><input name="cor" value={formState.cor} onChange={handleFormChange} required className="mt-1 p-2 w-full border rounded"/></div>
+                    <div><label className="block text-sm font-medium">Agente Notificador</label><input name="agente" value={formState.agente} onChange={handleFormChange} required className="mt-1 p-2 w-full border rounded"/></div>
+                    <div className="md:col-span-2"><label className="block text-sm font-medium">Endereço</label><input name="endereco" value={formState.endereco} onChange={handleFormChange} required className="mt-1 p-2 w-full border rounded"/></div>
+                    <div><label className="block text-sm font-medium">Número</label><input name="numero" value={formState.numero} onChange={handleFormChange} className="mt-1 p-2 w-full border rounded"/></div>
+                    <div><label className="block text-sm font-medium">Bairro</label><input name="bairro" value={formState.bairro} onChange={handleFormChange} required className="mt-1 p-2 w-full border rounded"/></div>
+                    <div className="lg:col-span-2"><label className="block text-sm font-medium">Referência</label><input name="referencia" value={formState.referencia} onChange={handleFormChange} className="mt-1 p-2 w-full border rounded"/></div>
+                    <div><label className="block text-sm font-medium">Data Notificação</label><input type="date" name="dataNotificacao" value={formState.dataNotificacao} onChange={handleFormChange} required className="mt-1 p-2 w-full border rounded"/></div>
+                    <div className="lg:col-span-3"><label className="block text-sm font-medium">Observações</label><textarea name="observacoes" value={formState.observacoes} onChange={handleFormChange} rows="2" className="mt-1 p-2 w-full border rounded"></textarea></div>
+                    <div className="lg:col-span-4"><button type="submit" className="w-full sm:w-auto px-6 py-2 bg-blue-600 text-white font-medium rounded-md shadow hover:bg-blue-700">Cadastrar</button></div>
                 </form>
-              </div>
-              <p className="mt-8 text-xs text-gray-500">&copy; {new Date().getFullYear()} Prefeitura de Itapema.</p>
-            </div>
-          );
-        }
-
-        // --- COMPONENTES DO DASHBOARD ---
-
-        function VehicleManagement({ currentUser }) {
-            const [allVeiculos, setAllVeiculos] = useState([]);
-            const [loadingVeiculos, setLoadingVeiculos] = useState(true);
-            const [filtroStatus, setFiltroStatus] = useState('Todos');
-            const [searchTerm, setSearchTerm] = useState('');
-            const [formState, setFormState] = useState({ placa: '', marcaModelo: '', cor: '', agente: '', endereco: '', numero: '', bairro: '', referencia: '', dataNotificacao: new Date().toISOString().split('T')[0], status: 'aguardando remoção', observacoes: '' });
-            const [modalData, setModalData] = useState({ vehicle: null, mode: 'view' });
-
-            const handleFormChange = (e) => {
-                const { name, value } = e.target;
-                setFormState(prev => ({ ...prev, [name]: value }));
-            };
-            
-            const handleEditFormChange = (e) => {
-                const { name, value } = e.target;
-                setModalData(prev => ({ ...prev, vehicle: { ...prev.vehicle, [name]: value }}));
-            };
-
-            const handleCadastroVeiculo = async (e) => {
-                e.preventDefault();
-                const { placa, marcaModelo, cor, agente, endereco, dataNotificacao } = formState;
-                if (!placa || !marcaModelo || !cor || !agente || !endereco || !dataNotificacao) { showToast("Placa, Marca/Modelo, Cor, Agente, Endereço e Data são obrigatórios.", "error"); return; }
-                
-                const veiculosRef = db.collection(`artifacts/${appId}/public/data/veiculos_abandonados_itapema`);
-                const qPlaca = veiculosRef.where("placa", "==", placa.toUpperCase());
-                const placaSnapshot = await qPlaca.get();
-                const denunciaAtiva = placaSnapshot.docs.some(doc => doc.data().status !== 'removido pelo proprietário');
-                if (!placaSnapshot.empty && denunciaAtiva) {
-                    showToast(`A placa ${placa.toUpperCase()} já possui uma denúncia ativa.`, "warning"); return;
-                }
-
-                try {
-                    const novoVeiculoData = { ...formState, placa: placa.toUpperCase(), dataNotificacao: firebase.firestore.Timestamp.fromDate(new Date(dataNotificacao + "T12:00:00Z")), matriculaAgenteSistema: currentUser.matricula, nomeAgenteSistema: currentUser.nome, dataRegistro: firebase.firestore.FieldValue.serverTimestamp() };
-                    await veiculosRef.add(novoVeiculoData);
-                    await logAction("VEÍCULO CRIADO", `Placa: ${novoVeiculoData.placa}`, currentUser);
-                    showToast("Veículo cadastrado com sucesso!", "success");
-                    setFormState({ placa: '', marcaModelo: '', cor: '', agente: '', endereco: '', numero: '', bairro: '', referencia: '', dataNotificacao: new Date().toISOString().split('T')[0], status: 'aguardando remoção', observacoes: '' });
-                } catch (error) { showToast("Erro ao cadastrar veículo.", "error"); }
-            };
-
-            const handleUpdateVehicle = async (e) => {
-                e.preventDefault();
-                if (!modalData.vehicle) return;
-                const { id, ...dataToUpdate } = modalData.vehicle;
-                const vehicleDocRef = db.collection(`artifacts/${appId}/public/data/veiculos_abandonados_itapema`).doc(id);
-                try {
-                    await vehicleDocRef.update({ ...dataToUpdate, dataNotificacao: firebase.firestore.Timestamp.fromDate(new Date(dataToUpdate.dataNotificacao)) });
-                    await logAction("VEÍCULO ATUALIZADO", `Placa: ${dataToUpdate.placa}`, currentUser);
-                    showToast("Veículo atualizado com sucesso!", "success");
-                    setModalData({ vehicle: null, mode: 'view' });
-                } catch (error) { showToast("Erro ao atualizar veículo.", "error"); }
-            };
-            
-            useEffect(() => {
-                if (!db) return;
-                const veiculosRef = db.collection(`artifacts/${appId}/public/data/veiculos_abandonados_itapema`);
-                const q = veiculosRef.orderBy('dataNotificacao', 'desc');
-                
-                const unsubscribe = q.onSnapshot((snapshot) => {
-                    const veiculosData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                    setAllVeiculos(veiculosData);
-                    setLoadingVeiculos(false);
-                }, () => { showToast("Erro ao carregar lista de veículos.", "error"); setLoadingVeiculos(false); });
-                return () => unsubscribe();
-            }, []);
-
-            const veiculosFiltrados = useMemo(() => {
-                return allVeiculos.filter(v => {
-                    const statusMatch = filtroStatus === 'Todos' || v.status === filtroStatus;
-                    const searchMatch = !searchTerm || (v.placa && v.placa.toLowerCase().includes(searchTerm.toLowerCase()));
-                    return statusMatch && searchMatch;
-                });
-            }, [allVeiculos, filtroStatus, searchTerm]);
-            
-            const handleDeleteVehicle = async (vehicleId, vehiclePlaca) => {
-                const vehicleDocRef = db.collection(`artifacts/${appId}/public/data/veiculos_abandonados_itapema`).doc(vehicleId);
-                try {
-                    await vehicleDocRef.delete();
-                    await logAction("VEÍCULO EXCLUÍDO", `Placa: ${vehiclePlaca}`, currentUser);
-                    showToast("Veículo excluído com sucesso.", "success");
-                } catch (error) { showToast("Erro ao excluir veículo.", "error"); }
-            };
-
-            const handlePrint = () => {
-                const printWindow = window.open('', '_blank');
-                const reportTitle = `Relatório de Veículos Abandonados - ${new Date().toLocaleDateString('pt-BR')}`;
-                const filterText = `Filtro aplicado: ${filtroStatus}. Pesquisa: "${searchTerm || 'nenhuma'}".`;
-                let tableContent = '';
-                veiculosFiltrados.forEach(v => {
-                    const { texto: prazoTexto } = calcularStatusPrazo(v.dataNotificacao);
-                    const enderecoCompleto = `${v.endereco || ''}, ${v.numero || 'S/N'} - ${v.bairro || ''}`;
-                    tableContent += `<tr>
-                        <td style="border: 1px solid #ddd; padding: 8px;">${v.placa || ''}</td>
-                        <td style="border: 1px solid #ddd; padding: 8px;">${v.marcaModelo || ''}</td>
-                        <td style="border: 1px solid #ddd; padding: 8px;">${v.agente || ''}</td>
-                        <td style="border: 1px solid #ddd; padding: 8px;">${enderecoCompleto}</td>
-                        <td style="border: 1px solid #ddd; padding: 8px;">${v.dataNotificacao?.toDate().toLocaleDateString('pt-BR') || ''}</td>
-                        <td style="border: 1px solid #ddd; padding: 8px;">${v.status || ''}</td>
-                        <td style="border: 1px solid #ddd; padding: 8px;">${prazoTexto}</td>
-                    </tr>`;
-                });
-                printWindow.document.write(`<html><head><title>${reportTitle}</title><style>body{font-family:sans-serif;}table{width:100%;border-collapse:collapse;}th,td{border:1px solid #ddd;padding:8px;text-align:left;}th{background-color:#f2f2f2;}@media print{body{-webkit-print-color-adjust:exact;}button{display:none;}}</style></head><body><h2>${reportTitle}</h2><p>${filterText}</p><table><thead><tr><th>Placa</th><th>Marca/Modelo</th><th>Agente</th><th>Endereço</th><th>Data Notificação</th><th>Status</th><th>Prazo</th></tr></thead><tbody>${tableContent}</tbody></table><button onclick="window.print()">Imprimir</button></body></html>`);
-                printWindow.document.close();
-            };
-
-            return (
-                <div className="space-y-8">
-                     <section className="bg-white p-6 rounded-lg shadow-md">
-                        <h2 className="text-xl font-semibold mb-4 text-gray-800 flex items-center"><PlusCircle className="mr-2" /> Cadastrar Novo Veículo</h2>
-                        <form onSubmit={handleCadastroVeiculo} className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-                            <div><label className="block text-sm font-medium">Placa</label><input name="placa" value={formState.placa} onChange={handleFormChange} required className="mt-1 p-2 w-full border rounded"/></div>
-                            <div><label className="block text-sm font-medium">Marca/Modelo</label><input name="marcaModelo" value={formState.marcaModelo} onChange={handleFormChange} required className="mt-1 p-2 w-full border rounded"/></div>
-                            <div><label className="block text-sm font-medium">Cor</label><input name="cor" value={formState.cor} onChange={handleFormChange} required className="mt-1 p-2 w-full border rounded"/></div>
-                            <div><label className="block text-sm font-medium">Agente Notificador</label><input name="agente" value={formState.agente} onChange={handleFormChange} required className="mt-1 p-2 w-full border rounded"/></div>
-                            <div className="md:col-span-2"><label className="block text-sm font-medium">Endereço</label><input name="endereco" value={formState.endereco} onChange={handleFormChange} required className="mt-1 p-2 w-full border rounded"/></div>
-                            <div><label className="block text-sm font-medium">Número</label><input name="numero" value={formState.numero} onChange={handleFormChange} className="mt-1 p-2 w-full border rounded"/></div>
-                            <div><label className="block text-sm font-medium">Bairro</label><input name="bairro" value={formState.bairro} onChange={handleFormChange} required className="mt-1 p-2 w-full border rounded"/></div>
-                            <div className="lg:col-span-2"><label className="block text-sm font-medium">Referência</label><input name="referencia" value={formState.referencia} onChange={handleFormChange} className="mt-1 p-2 w-full border rounded"/></div>
-                            <div><label className="block text-sm font-medium">Data Notificação</label><input type="date" name="dataNotificacao" value={formState.dataNotificacao} onChange={handleFormChange} required className="mt-1 p-2 w-full border rounded"/></div>
-                            <div className="lg:col-span-3"><label className="block text-sm font-medium">Observações</label><textarea name="observacoes" value={formState.observacoes} onChange={handleFormChange} rows="2" className="mt-1 p-2 w-full border rounded"></textarea></div>
-                            <div className="lg:col-span-4"><button type="submit" className="w-full sm:w-auto px-6 py-2 bg-blue-600 text-white font-medium rounded-md shadow hover:bg-blue-700">Cadastrar</button></div>
-                        </form>
-                    </section>
-                    <section className="bg-white p-6 rounded-lg shadow-md">
-                         <div className="flex flex-col md:flex-row justify-between items-center mb-4 gap-4">
-                            <h2 className="text-xl font-semibold text-gray-800 flex items-center"><ListChecks className="mr-2"/> Lista de Veículos</h2>
-                            <div className="flex flex-col sm:flex-row gap-2 w-full md:w-auto">
-                                <div className="relative w-full sm:w-auto"><input type="text" placeholder="Pesquisar por placa..." value={searchTerm} onChange={e => setSearchTerm(e.target.value)} className="pl-10 pr-3 py-2 border rounded-md"/><Search className="absolute left-3 top-1/2 -translate-y-1/2 h-5 w-5 text-gray-400"/></div>
-                                <select value={filtroStatus} onChange={e => setFiltroStatus(e.target.value)} className="p-2 border rounded-md">
-                                    <option value="Todos">Todos os Status</option>
-                                    <option value="aguardando remoção">Aguardando Remoção</option>
-                                    <option value="removido ao pátio">Removido ao Pátio</option>
-                                    <option value="removido pelo proprietário">Removido pelo Proprietário</option>
-                                </select>
-                                <button onClick={handlePrint} className="flex items-center px-4 py-2 text-sm font-medium text-white bg-gray-600 hover:bg-gray-700 rounded-md shadow-sm"><Printer size={16} className="mr-2" />Imprimir</button>
-                            </div>
-                        </div>
-                        <div className="overflow-x-auto">
-                            <table className="min-w-full divide-y divide-gray-200">
-                                <thead className="bg-gray-50"><tr><th className="px-4 py-3 text-left text-xs font-medium uppercase">Placa</th><th className="px-4 py-3 text-left text-xs font-medium uppercase">Marca/Modelo</th><th className="px-4 py-3 text-left text-xs font-medium uppercase">Data Notificação</th><th className="px-4 py-3 text-left text-xs font-medium uppercase">Status</th><th className="px-4 py-3 text-left text-xs font-medium uppercase">Prazo</th><th className="px-4 py-3 text-left text-xs font-medium uppercase">Ações</th></tr></thead>
-                                <tbody className="bg-white divide-y divide-gray-200">
-                                    {loadingVeiculos ? (<tr><td colSpan="6" className="text-center py-4">A carregar...</td></tr>) : veiculosFiltrados.length === 0 ? (<tr><td colSpan="6" className="text-center py-4">Nenhum veículo encontrado.</td></tr>) : (
-                                        veiculosFiltrados.map(v => {
-                                            const { texto: prazoTexto, classeCor: prazoCor } = calcularStatusPrazo(v.dataNotificacao);
-                                            const canEdit = currentUser.tipo === 'Administrador' || currentUser.tipo === 'Padrão';
-                                            return (
-                                                <tr key={v.id} className="hover:bg-gray-50">
-                                                    <td className="px-4 py-3 text-sm font-medium">{v.placa}</td><td className="px-4 py-3 text-sm">{v.marcaModelo}</td><td className="px-4 py-3 text-sm">{v.dataNotificacao.toDate().toLocaleDateString('pt-BR')}</td>
-                                                    <td className="px-4 py-3 text-sm"><span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${ v.status === 'removido ao pátio' ? 'bg-blue-100 text-blue-800' : v.status === 'removido pelo proprietário' ? 'bg-green-100 text-green-800' : 'bg-yellow-100 text-yellow-800' }`}>{v.status}</span></td>
-                                                    <td className={`px-4 py-3 text-sm ${prazoCor}`}>{prazoTexto}</td>
-                                                    <td className="px-4 py-3 text-sm space-x-2">
-                                                        <button onClick={() => setModalData({ vehicle: { ...v, dataNotificacao: v.dataNotificacao.toDate().toISOString().split('T')[0] }, mode: 'view' })} className="text-blue-600 hover:text-blue-800"><Eye size={18}/></button>
-                                                        {canEdit && <button onClick={() => setModalData({ vehicle: { ...v, dataNotificacao: v.dataNotificacao.toDate().toISOString().split('T')[0] }, mode: 'edit' })} className="text-yellow-600 hover:text-yellow-800"><Edit2 size={18}/></button>}
-                                                        {currentUser.tipo === 'Administrador' && <button onClick={() => handleDeleteVehicle(v.id, v.placa)} className="text-red-600 hover:text-red-800"><Trash2 size={18}/></button>}
-                                                    </td>
-                                                </tr>
-                                            )
-                                        })
-                                    )}
-                                </tbody>
-                            </table>
-                        </div>
-                    </section>
-                    {modalData.vehicle && (
-                        <div className="fixed inset-0 bg-black bg-opacity-50 flex justify-center items-center z-50 p-4">
-                            <div className="bg-white p-6 rounded-lg shadow-xl w-full max-w-2xl max-h-full overflow-y-auto">
-                                <h3 className="text-lg font-semibold mb-4">{modalData.mode === 'edit' ? 'Editar Veículo' : 'Detalhes do Veículo'}</h3>
-                                <form onSubmit={handleUpdateVehicle} className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                    <div><label className="block text-sm">Placa</label><input name="placa" value={modalData.vehicle.placa} onChange={handleEditFormChange} disabled={modalData.mode==='view'} className="mt-1 p-2 w-full border rounded disabled:bg-gray-100"/></div>
-                                    <div><label className="block text-sm">Marca/Modelo</label><input name="marcaModelo" value={modalData.vehicle.marcaModelo} onChange={handleEditFormChange} disabled={modalData.mode==='view'} className="mt-1 p-2 w-full border rounded disabled:bg-gray-100"/></div>
-                                    <div><label className="block text-sm">Cor</label><input name="cor" value={modalData.vehicle.cor} onChange={handleEditFormChange} disabled={modalData.mode==='view'} className="mt-1 p-2 w-full border rounded disabled:bg-gray-100"/></div>
-                                    <div><label className="block text-sm">Agente Notificador</label><input name="agente" value={modalData.vehicle.agente} onChange={handleEditFormChange} disabled={modalData.mode==='view'} className="mt-1 p-2 w-full border rounded disabled:bg-gray-100"/></div>
-                                    <div className="md:col-span-2"><label className="block text-sm">Endereço</label><input name="endereco" value={modalData.vehicle.endereco} onChange={handleEditFormChange} disabled={modalData.mode==='view'} className="mt-1 p-2 w-full border rounded disabled:bg-gray-100"/></div>
-                                    <div><label className="block text-sm">Número</label><input name="numero" value={modalData.vehicle.numero} onChange={handleEditFormChange} disabled={modalData.mode==='view'} className="mt-1 p-2 w-full border rounded disabled:bg-gray-100"/></div>
-                                    <div><label className="block text-sm">Bairro</label><input name="bairro" value={modalData.vehicle.bairro} onChange={handleEditFormChange} disabled={modalData.mode==='view'} className="mt-1 p-2 w-full border rounded disabled:bg-gray-100"/></div>
-                                    <div className="md:col-span-2"><label className="block text-sm">Referência</label><input name="referencia" value={modalData.vehicle.referencia} onChange={handleEditFormChange} disabled={modalData.mode==='view'} className="mt-1 p-2 w-full border rounded disabled:bg-gray-100"/></div>
-                                    <div><label className="block text-sm">Data Notificação</label><input type="date" name="dataNotificacao" value={modalData.vehicle.dataNotificacao} onChange={handleEditFormChange} disabled={modalData.mode==='view'} className="mt-1 p-2 w-full border rounded disabled:bg-gray-100"/></div>
-                                    <div><label className="block text-sm">Status</label><select name="status" value={modalData.vehicle.status} onChange={handleEditFormChange} disabled={modalData.mode==='view'} className="mt-1 p-2 w-full border rounded disabled:bg-gray-100"><option value="aguardando remoção">Aguardando Remoção</option><option value="removido ao pátio">Removido ao Pátio</option><option value="removido pelo proprietário">Removido pelo Proprietário</option></select></div>
-                                    <div className="md:col-span-2"><label className="block text-sm">Observações</label><textarea name="observacoes" value={modalData.vehicle.observacoes} onChange={handleEditFormChange} rows="3" disabled={modalData.mode==='view'} className="mt-1 p-2 w-full border rounded disabled:bg-gray-100"></textarea></div>
-                                    <div className="md:col-span-2 mt-6 flex justify-end space-x-3">
-                                        <button type="button" onClick={() => setModalData({vehicle: null, mode: 'view'})} className="px-4 py-2 bg-gray-200 rounded">Cancelar</button>
-                                        {modalData.mode === 'edit' && <button type="submit" className="px-4 py-2 bg-blue-600 text-white rounded">Salvar Alterações</button>}
-                                    </div>
-                                </form>
-                            </div>
-                        </div>
-                    )}
+            </section>
+            <section className="bg-white p-6 rounded-lg shadow-md">
+                 <div className="flex flex-col md:flex-row justify-between items-center mb-4 gap-4">
+                    <h2 className="text-xl font-semibold text-gray-800 flex items-center"><ListChecks className="mr-2"/> Lista de Veículos</h2>
+                    <div className="flex flex-col sm:flex-row gap-2 w-full md:w-auto">
+                        <div className="relative w-full sm:w-auto"><input type="text" placeholder="Pesquisar por placa..." value={searchTerm} onChange={e => setSearchTerm(e.target.value)} className="pl-10 pr-3 py-2 border rounded-md"/><Search className="absolute left-3 top-1/2 -translate-y-1/2 h-5 w-5 text-gray-400"/></div>
+                        <select value={filtroStatus} onChange={e => setFiltroStatus(e.target.value)} className="p-2 border rounded-md">
+                            <option value="Todos">Todos os Status</option>
+                            <option value="aguardando remoção">Aguardando Remoção</option>
+                            <option value="removido ao pátio">Removido ao Pátio</option>
+                            <option value="removido pelo proprietário">Removido pelo Proprietário</option>
+                        </select>
+                        <button onClick={handlePrint} className="flex items-center px-4 py-2 text-sm font-medium text-white bg-gray-600 hover:bg-gray-700 rounded-md shadow-sm"><Printer size={16} className="mr-2" />Imprimir</button>
+                    </div>
                 </div>
-            );
-        }
-
-        function UserManagement({ currentUser }) {
-            const [users, setUsers] = useState([]);
-            const [loadingUsers, setLoadingUsers] = useState(true);
-            const [newUser, setNewUser] = useState({ matricula: '', nome: '', senha: '', tipo: 'Consulta', aprovado: true });
-            const [editingUser, setEditingUser] = useState(null);
-
-            useEffect(() => {
-                if (!db) return;
-                const usersCollectionRef = db.collection(`artifacts/${appId}/public/data/users`);
-                const q = usersCollectionRef.orderBy("nome");
-                const unsubscribe = q.onSnapshot((snapshot) => {
-                    setUsers(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-                    setLoadingUsers(false);
-                }, () => { showToast("Erro ao carregar utilizadores.", "error"); setLoadingUsers(false); });
-                return () => unsubscribe();
-            }, []);
-
-            const handleNewUserChange = (e) => {
-                const { name, value } = e.target;
-                setNewUser(prev => ({ ...prev, [name]: value }));
-            };
-            
-            const handleEditUserChange = (e) => {
-                const { name, value } = e.target;
-                setEditingUser(prev => ({ ...prev, [name]: value }));
-            };
-
-            const handleAddUser = async (e) => {
-                e.preventDefault();
-                const { matricula, nome, senha, tipo } = newUser;
-                if (!matricula || !nome || !senha || !tipo) { showToast("Todos os campos são obrigatórios.", "error"); return; }
-                if (matricula.length !== 5 || !/^\d+$/.test(matricula)) { showToast("A matrícula deve conter 5 dígitos.", "error"); return; }
-
-                const userDocRef = db.collection(`artifacts/${appId}/public/data/users`).doc(matricula);
-                try {
-                    const docSnap = await userDocRef.get();
-                    if (docSnap.exists) { showToast("Esta matrícula já está registada.", "error"); return; }
-                    await userDocRef.set({ ...newUser, dataCriacao: firebase.firestore.FieldValue.serverTimestamp() });
-                    await logAction("UTILIZADOR CRIADO", `Matrícula: ${matricula}, Nome: ${nome}, Tipo: ${tipo}`, currentUser);
-                    showToast("Utilizador adicionado com sucesso!", "success");
-                    setNewUser({ matricula: '', nome: '', senha: '', tipo: 'Consulta', aprovado: true });
-                } catch (error) { showToast("Erro ao adicionar utilizador.", "error"); }
-            };
-
-            const handleUpdateUser = async (e) => {
-                e.preventDefault();
-                if (!editingUser) return;
-                const { nome, tipo } = editingUser;
-                const userDocRef = db.collection(`artifacts/${appId}/public/data/users`).doc(editingUser.id);
-                try {
-                    await userDocRef.update({ nome, tipo });
-                    await logAction("UTILIZADOR ATUALIZADO", `Utilizador: ${nome} (${editingUser.id})`, currentUser);
-                    showToast("Utilizador atualizado com sucesso!", "success");
-                    setEditingUser(null);
-                } catch (error) { showToast("Erro ao atualizar utilizador.", "error"); }
-            };
-
-            const handleDeleteUser = async (user) => {
-                if (user.id === '12937') { showToast("Não pode excluir o admin.", "error"); return; }
-                const userDocRef = db.collection(`artifacts/${appId}/public/data/users`).doc(user.id);
-                try {
-                    await userDocRef.delete();
-                    await logAction("UTILIZADOR EXCLUÍDO", `Utilizador: ${user.nome} (${user.id})`, currentUser);
-                    showToast("Utilizador excluído.", "success");
-                } catch (error) { showToast("Erro ao excluir utilizador.", "error"); }
-            };
-            
-            return (
-              <div className="space-y-8">
-                <section className="bg-white p-6 rounded-lg shadow-md">
-                    <h2 className="text-xl font-semibold mb-4 text-gray-800 flex items-center"><UserPlus className="mr-2"/> Adicionar Novo Utilizador</h2>
-                    <form onSubmit={handleAddUser} className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 items-end">
-                        <div><label className="block text-sm font-medium">Matrícula</label><input name="matricula" value={newUser.matricula} onChange={handleNewUserChange} className="mt-1 p-2 w-full border rounded"/></div>
-                        <div><label className="block text-sm font-medium">Nome Completo</label><input name="nome" value={newUser.nome} onChange={handleNewUserChange} className="mt-1 p-2 w-full border rounded"/></div>
-                        <div><label className="block text-sm font-medium">Senha</label><input type="password" name="senha" value={newUser.senha} onChange={handleNewUserChange} className="mt-1 p-2 w-full border rounded"/></div>
-                        <div><label className="block text-sm font-medium">Tipo</label>
-                            <select name="tipo" value={newUser.tipo} onChange={handleNewUserChange} className="mt-1 p-2 w-full border rounded">
-                                <option value="Consulta">Consulta</option><option value="Padrão">Padrão</option><option value="Administrador">Administrador</option>
-                            </select>
-                        </div>
-                        <div className="lg:col-start-4"><button type="submit" className="w-full px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">Adicionar</button></div>
-                    </form>
-                </section>
-                <section className="bg-white p-6 rounded-lg shadow-md">
-                    <h2 className="text-xl font-semibold mb-4 text-gray-800 flex items-center"><Users className="mr-2"/> Utilizadores Registados</h2>
-                    <div className="overflow-x-auto">
-                        <table className="min-w-full divide-y divide-gray-200">
-                            <thead className="bg-gray-50">
-                                <tr><th className="px-4 py-3 text-left text-xs font-medium uppercase">Nome</th><th className="px-4 py-3 text-left text-xs font-medium uppercase">Matrícula</th><th className="px-4 py-3 text-left text-xs font-medium uppercase">Tipo</th><th className="px-4 py-3 text-left text-xs font-medium uppercase">Ações</th></tr>
-                            </thead>
-                            <tbody className="bg-white divide-y divide-gray-200">
-                                {loadingUsers ? (<tr><td colSpan="4" className="text-center py-4">A carregar...</td></tr>) : (
-                                    users.map(user => (
-                                        <tr key={user.id}>
-                                            <td className="px-4 py-3 text-sm">{user.nome}</td><td className="px-4 py-3 text-sm">{user.matricula}</td><td className="px-4 py-3 text-sm">{user.tipo}</td>
+                <div className="overflow-x-auto">
+                    <table className="min-w-full divide-y divide-gray-200">
+                        <thead className="bg-gray-50"><tr><th className="px-4 py-3 text-left text-xs font-medium uppercase">Placa</th><th className="px-4 py-3 text-left text-xs font-medium uppercase">Marca/Modelo</th><th className="px-4 py-3 text-left text-xs font-medium uppercase">Data Notificação</th><th className="px-4 py-3 text-left text-xs font-medium uppercase">Status</th><th className="px-4 py-3 text-left text-xs font-medium uppercase">Prazo</th><th className="px-4 py-3 text-left text-xs font-medium uppercase">Ações</th></tr></thead>
+                        <tbody className="bg-white divide-y divide-gray-200">
+                            {loadingVeiculos ? (<tr><td colSpan="6" className="text-center py-4">A carregar...</td></tr>) : veiculosFiltrados.length === 0 ? (<tr><td colSpan="6" className="text-center py-4">Nenhum veículo encontrado.</td></tr>) : (
+                                veiculosFiltrados.map(v => {
+                                    const { texto: prazoTexto, classeCor: prazoCor } = calcularStatusPrazo(v.dataNotificacao);
+                                    const canEdit = currentUser.tipo === 'Administrador' || currentUser.tipo === 'Padrão';
+                                    return (
+                                        <tr key={v.id} className="hover:bg-gray-50">
+                                            <td className="px-4 py-3 text-sm font-medium">{v.placa}</td><td className="px-4 py-3 text-sm">{v.marcaModelo}</td><td className="px-4 py-3 text-sm">{v.dataNotificacao.toDate().toLocaleDateString('pt-BR')}</td>
+                                            <td className="px-4 py-3 text-sm"><span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${ v.status === 'removido ao pátio' ? 'bg-blue-100 text-blue-800' : v.status === 'removido pelo proprietário' ? 'bg-green-100 text-green-800' : 'bg-yellow-100 text-yellow-800' }`}>{v.status}</span></td>
+                                            <td className={`px-4 py-3 text-sm ${prazoCor}`}>{prazoTexto}</td>
                                             <td className="px-4 py-3 text-sm space-x-2">
-                                                <button onClick={() => setEditingUser(user)} className="text-yellow-600 hover:text-yellow-800"><Edit2 size={18}/></button>
-                                                {user.id !== '12937' && <button onClick={() => handleDeleteUser(user)} className="text-red-600 hover:text-red-800"><Trash2 size={18}/></button>}
+                                                <button onClick={() => setModalData({ vehicle: { ...v, dataNotificacao: v.dataNotificacao.toDate().toISOString().split('T')[0] }, mode: 'view' })} className="text-blue-600 hover:text-blue-800"><Eye size={18}/></button>
+                                                {canEdit && <button onClick={() => setModalData({ vehicle: { ...v, dataNotificacao: v.dataNotificacao.toDate().toISOString().split('T')[0] }, mode: 'edit' })} className="text-yellow-600 hover:text-yellow-800"><Edit2 size={18}/></button>}
+                                                {currentUser.tipo === 'Administrador' && <button onClick={() => handleDeleteVehicle(v.id, v.placa)} className="text-red-600 hover:text-red-800"><Trash2 size={18}/></button>}
                                             </td>
                                         </tr>
-                                    ))
-                                )}
-                            </tbody>
-                        </table>
-                    </div>
-                </section>
-
-                {editingUser && (
-                    <div className="fixed inset-0 bg-black bg-opacity-50 flex justify-center items-center z-50">
-                        <div className="bg-white p-6 rounded-lg shadow-xl w-full max-w-md">
-                            <h3 className="text-lg font-semibold mb-4">Editar Utilizador</h3>
-                            <form onSubmit={handleUpdateUser}>
-                                <div className="space-y-4">
-                                    <div><label className="block text-sm">Nome</label><input name="nome" value={editingUser.nome} onChange={handleEditUserChange} className="mt-1 p-2 w-full border rounded"/></div>
-                                    <div><label className="block text-sm">Tipo</label>
-                                        <select name="tipo" value={editingUser.tipo} onChange={handleEditUserChange} className="mt-1 p-2 w-full border rounded">
-                                            <option value="Consulta">Consulta</option><option value="Padrão">Padrão</option><option value="Administrador">Administrador</option>
-                                        </select>
-                                    </div>
-                                </div>
-                                <div className="mt-6 flex justify-end space-x-3">
-                                    <button type="button" onClick={() => setEditingUser(null)} className="px-4 py-2 bg-gray-200 rounded">Cancelar</button>
-                                    <button type="submit" className="px-4 py-2 bg-blue-600 text-white rounded">Salvar</button>
-                                </div>
-                            </form>
-                        </div>
-                    </div>
-                )}
-              </div>
-            );
-        }
-
-        function AuditLogViewer() {
-            const [logs, setLogs] = useState([]);
-            const [loadingLogs, setLoadingLogs] = useState(true);
-            useEffect(() => {
-                if (!db) return;
-                const logsRef = db.collection(`artifacts/${appId}/public/data/audit_logs`);
-                const q = logsRef.orderBy('timestamp', 'desc');
-                const unsubscribe = q.onSnapshot((snapshot) => {
-                    setLogs(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-                    setLoadingLogs(false);
-                }, () => { showToast("Erro ao carregar log de alterações.", "error"); setLoadingLogs(false); });
-                return () => unsubscribe();
-            }, []);
-
-            return (
-                <section className="bg-white p-6 rounded-lg shadow-md">
-                    <h2 className="text-xl font-semibold mb-4 text-gray-800 flex items-center"><FileText className="mr-2"/> Log de Alterações do Sistema</h2>
-                    <div className="overflow-x-auto">
-                        <table className="min-w-full divide-y divide-gray-200">
-                            <thead className="bg-gray-50">
-                                <tr><th className="px-4 py-3 text-left text-xs font-medium uppercase">Data/Hora</th><th className="px-4 py-3 text-left text-xs font-medium uppercase">Autor</th><th className="px-4 py-3 text-left text-xs font-medium uppercase">Ação</th><th className="px-4 py-3 text-left text-xs font-medium uppercase">Detalhes</th></tr>
-                            </thead>
-                            <tbody className="bg-white divide-y divide-gray-200">
-                                {loadingLogs ? (<tr><td colSpan="4" className="text-center py-4">A carregar...</td></tr>) : logs.length === 0 ? (<tr><td colSpan="4" className="text-center py-4">Nenhum registo.</td></tr>) : (
-                                    logs.map(log => (
-                                        <tr key={log.id}>
-                                            <td className="px-4 py-3 text-sm text-gray-500">{log.timestamp.toDate().toLocaleString('pt-BR')}</td>
-                                            <td className="px-4 py-3 text-sm">{log.author.nome} ({log.author.matricula})</td>
-                                            <td className="px-4 py-3 text-sm font-semibold">{log.action}</td>
-                                            <td className="px-4 py-3 text-sm text-gray-600">{log.details}</td>
-                                        </tr>
-                                    ))
-                                )}
-                            </tbody>
-                        </table>
-                    </div>
-                </section>
-            );
-        }
-
-        function DashboardPage() {
-            const { currentUser, logout, criarUtilizadoresIniciaisSeNaoExistirem } = useAuth();
-            const [activeTab, setActiveTab] = useState('veiculos');
-            return (
-                <div className="p-4 md:p-6 bg-gray-100 min-h-screen">
-                    <header className="flex flex-col md:flex-row justify-between items-center mb-6 pb-4 border-b">
-                        <div className="mb-4 md:mb-0 text-center md:text-left"><h1 className="text-2xl md:text-3xl font-bold text-blue-700">Veículos Abandono Itapema</h1><p className="text-sm text-gray-600">Bem-vindo, <span className="font-semibold">{currentUser.nome || 'Utilizador'}</span> ({currentUser.tipo})</p></div>
-                        <button onClick={logout} className="flex items-center px-4 py-2 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded-md shadow-sm"><LogOut size={16} className="mr-2" />Sair</button>
-                    </header>
-                    <div className="mb-6 flex border-b flex-wrap">
-                        <button onClick={() => setActiveTab('veiculos')} className={`px-4 py-2 font-medium text-sm flex items-center ${activeTab === 'veiculos' ? 'border-b-2 border-blue-600 text-blue-600' : 'text-gray-500 hover:text-blue-600'}`}><Car size={16} className="mr-2" /> Veículos</button>
-                        {currentUser.tipo === 'Administrador' && (<>
-                            <button onClick={() => setActiveTab('usuarios')} className={`px-4 py-2 font-medium text-sm flex items-center ${activeTab === 'usuarios' ? 'border-b-2 border-blue-600 text-blue-600' : 'text-gray-500 hover:text-blue-600'}`}><UserCog size={16} className="mr-2" /> Utilizadores</button>
-                            <button onClick={() => setActiveTab('logs')} className={`px-4 py-2 font-medium text-sm flex items-center ${activeTab === 'logs' ? 'border-b-2 border-blue-600 text-blue-600' : 'text-gray-500 hover:text-blue-600'}`}><FileText size={16} className="mr-2" /> Log de Alterações</button>
-                            <button onClick={criarUtilizadoresIniciaisSeNaoExistirem} className="ml-auto px-4 py-2 font-medium text-sm flex items-center text-purple-600 hover:text-purple-800"><Users size={16} className="mr-2"/>Criar Utilizadores Iniciais</button>
-                        </>)}
-                    </div>
-                    <main>
-                        {activeTab === 'veiculos' && <VehicleManagement currentUser={currentUser} />}
-                        {activeTab === 'usuarios' && currentUser.tipo === 'Administrador' && <UserManagement currentUser={currentUser} />}
-                        {activeTab === 'logs' && currentUser.tipo === 'Administrador' && <AuditLogViewer />}
-                    </main>
+                                    )
+                                })
+                            )}
+                        </tbody>
+                    </table>
                 </div>
-            );
-        }
+            </section>
+            {modalData.vehicle && (
+                <div className="fixed inset-0 bg-black bg-opacity-50 flex justify-center items-center z-50 p-4">
+                    <div className="bg-white p-6 rounded-lg shadow-xl w-full max-w-2xl max-h-full overflow-y-auto">
+                        <h3 className="text-lg font-semibold mb-4">{modalData.mode === 'edit' ? 'Editar Veículo' : 'Detalhes do Veículo'}</h3>
+                        <form onSubmit={handleUpdateVehicle} className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div><label className="block text-sm">Placa</label><input name="placa" value={modalData.vehicle.placa} onChange={handleEditFormChange} disabled={modalData.mode==='view'} className="mt-1 p-2 w-full border rounded disabled:bg-gray-100"/></div>
+                            <div><label className="block text-sm">Marca/Modelo</label><input name="marcaModelo" value={modalData.vehicle.marcaModelo} onChange={handleEditFormChange} disabled={modalData.mode==='view'} className="mt-1 p-2 w-full border rounded disabled:bg-gray-100"/></div>
+                            <div><label className="block text-sm">Cor</label><input name="cor" value={modalData.vehicle.cor} onChange={handleEditFormChange} disabled={modalData.mode==='view'} className="mt-1 p-2 w-full border rounded disabled:bg-gray-100"/></div>
+                            <div><label className="block text-sm">Agente Notificador</label><input name="agente" value={modalData.vehicle.agente} onChange={handleEditFormChange} disabled={modalData.mode==='view'} className="mt-1 p-2 w-full border rounded disabled:bg-gray-100"/></div>
+                            <div className="md:col-span-2"><label className="block text-sm">Endereço</label><input name="endereco" value={modalData.vehicle.endereco} onChange={handleEditFormChange} disabled={modalData.mode==='view'} className="mt-1 p-2 w-full border rounded disabled:bg-gray-100"/></div>
+                            <div><label className="block text-sm">Número</label><input name="numero" value={modalData.vehicle.numero} onChange={handleEditFormChange} disabled={modalData.mode==='view'} className="mt-1 p-2 w-full border rounded disabled:bg-gray-100"/></div>
+                            <div><label className="block text-sm">Bairro</label><input name="bairro" value={modalData.vehicle.bairro} onChange={handleEditFormChange} disabled={modalData.mode==='view'} className="mt-1 p-2 w-full border rounded disabled:bg-gray-100"/></div>
+                            <div className="md:col-span-2"><label className="block text-sm">Referência</label><input name="referencia" value={modalData.vehicle.referencia} onChange={handleEditFormChange} disabled={modalData.mode==='view'} className="mt-1 p-2 w-full border rounded disabled:bg-gray-100"/></div>
+                            <div><label className="block text-sm">Data Notificação</label><input type="date" name="dataNotificacao" value={modalData.vehicle.dataNotificacao} onChange={handleEditFormChange} disabled={modalData.mode==='view'} className="mt-1 p-2 w-full border rounded disabled:bg-gray-100"/></div>
+                            <div><label className="block text-sm">Status</label><select name="status" value={modalData.vehicle.status} onChange={handleEditFormChange} disabled={modalData.mode==='view'} className="mt-1 p-2 w-full border rounded disabled:bg-gray-100"><option value="aguardando remoção">Aguardando Remoção</option><option value="removido ao pátio">Removido ao Pátio</option><option value="removido pelo proprietário">Removido pelo Proprietário</option></select></div>
+                            <div className="md:col-span-2"><label className="block text-sm">Observações</label><textarea name="observacoes" value={modalData.vehicle.observacoes} onChange={handleEditFormChange} rows="3" disabled={modalData.mode==='view'} className="mt-1 p-2 w-full border rounded disabled:bg-gray-100"></textarea></div>
+                            <div className="md:col-span-2 mt-6 flex justify-end space-x-3">
+                                <button type="button" onClick={() => setModalData({vehicle: null, mode: 'view'})} className="px-4 py-2 bg-gray-200 rounded">Cancelar</button>
+                                {modalData.mode === 'edit' && <button type="submit" className="px-4 py-2 bg-blue-600 text-white rounded">Salvar Alterações</button>}
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
 
-        // --- APP RAÍZ ---
-        function App() {
-          if (firebaseInitializationError) return <ErrorScreen message="Erro Crítico de Configuração" details={firebaseInitializationError} />;
-          return <AuthProvider><AppContent /></AuthProvider>;
-        }
-        function AppContent() {
-          const { currentUser, loading } = useAuth();
-          if (loading) return <LoadingScreen />;
-          return currentUser ? <DashboardPage /> : <LoginPage />;
-        }
+function UserManagement({ currentUser }) {
+    const [users, setUsers] = useState([]);
+    const [loadingUsers, setLoadingUsers] = useState(true);
+    const [newUser, setNewUser] = useState({ matricula: '', nome: '', senha: '', tipo: 'Consulta', aprovado: true });
+    const [editingUser, setEditingUser] = useState(null);
 
-        const container = document.getElementById('root');
-        const root = ReactDOM.createRoot(container);
-        root.render(<App />);
+    useEffect(() => {
+        if (!db) return;
+        const usersCollectionRef = db.collection(`artifacts/${appId}/public/data/users`);
+        const q = usersCollectionRef.orderBy("nome");
+        const unsubscribe = q.onSnapshot((snapshot) => {
+            setUsers(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+            setLoadingUsers(false);
+        }, () => { showToast("Erro ao carregar utilizadores.", "error"); setLoadingUsers(false); });
+        return () => unsubscribe();
+    }, []);
+
+    const handleNewUserChange = (e) => {
+        const { name, value } = e.target;
+        setNewUser(prev => ({ ...prev, [name]: value }));
+    };
+    
+    const handleEditUserChange = (e) => {
+        const { name, value } = e.target;
+        setEditingUser(prev => ({ ...prev, [name]: value }));
+    };
+
+    const handleAddUser = async (e) => {
+        e.preventDefault();
+        const { matricula, nome, senha, tipo } = newUser;
+        if (!matricula || !nome || !senha || !tipo) { showToast("Todos os campos são obrigatórios.", "error"); return; }
+        if (matricula.length !== 5 || !/^\d+$/.test(matricula)) { showToast("A matrícula deve conter 5 dígitos.", "error"); return; }
+
+        const userDocRef = db.collection(`artifacts/${appId}/public/data/users`).doc(matricula);
+        try {
+            const docSnap = await userDocRef.get();
+            if (docSnap.exists) { showToast("Esta matrícula já está registada.", "error"); return; }
+            await userDocRef.set({ ...newUser, dataCriacao: firebase.firestore.FieldValue.serverTimestamp() });
+            await logAction("UTILIZADOR CRIADO", `Matrícula: ${matricula}, Nome: ${nome}, Tipo: ${tipo}`, currentUser);
+            showToast("Utilizador adicionado com sucesso!", "success");
+            setNewUser({ matricula: '', nome: '', senha: '', tipo: 'Consulta', aprovado: true });
+        } catch (error) { showToast("Erro ao adicionar utilizador.", "error"); }
+    };
+
+    const handleUpdateUser = async (e) => {
+        e.preventDefault();
+        if (!editingUser) return;
+        const { nome, tipo } = editingUser;
+        const userDocRef = db.collection(`artifacts/${appId}/public/data/users`).doc(editingUser.id);
+        try {
+            await userDocRef.update({ nome, tipo });
+            await logAction("UTILIZADOR ATUALIZADO", `Utilizador: ${nome} (${editingUser.id})`, currentUser);
+            showToast("Utilizador atualizado com sucesso!", "success");
+            setEditingUser(null);
+        } catch (error) { showToast("Erro ao atualizar utilizador.", "error"); }
+    };
+
+    const handleDeleteUser = async (user) => {
+        if (user.id === '12937') { showToast("Não pode excluir o admin.", "error"); return; }
+        const userDocRef = db.collection(`artifacts/${appId}/public/data/users`).doc(user.id);
+        try {
+            await userDocRef.delete();
+            await logAction("UTILIZADOR EXCLUÍDO", `Utilizador: ${user.nome} (${user.id})`, currentUser);
+            showToast("Utilizador excluído.", "success");
+        } catch (error) { showToast("Erro ao excluir utilizador.", "error"); }
+    };
+    
+    return (
+      <div className="space-y-8">
+        <section className="bg-white p-6 rounded-lg shadow-md">
+            <h2 className="text-xl font-semibold mb-4 text-gray-800 flex items-center"><UserPlus className="mr-2"/> Adicionar Novo Utilizador</h2>
+            <form onSubmit={handleAddUser} className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 items-end">
+                <div><label className="block text-sm font-medium">Matrícula</label><input name="matricula" value={newUser.matricula} onChange={handleNewUserChange} className="mt-1 p-2 w-full border rounded"/></div>
+                <div><label className="block text-sm font-medium">Nome Completo</label><input name="nome" value={newUser.nome} onChange={handleNewUserChange} className="mt-1 p-2 w-full border rounded"/></div>
+                <div><label className="block text-sm font-medium">Senha</label><input type="password" name="senha" value={newUser.senha} onChange={handleNewUserChange} className="mt-1 p-2 w-full border rounded"/></div>
+                <div><label className="block text-sm font-medium">Tipo</label>
+                    <select name="tipo" value={newUser.tipo} onChange={handleNewUserChange} className="mt-1 p-2 w-full border rounded">
+                        <option value="Consulta">Consulta</option><option value="Padrão">Padrão</option><option value="Administrador">Administrador</option>
+                    </select>
+                </div>
+                <div className="lg:col-start-4"><button type="submit" className="w-full px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">Adicionar</button></div>
+            </form>
+        </section>
+        <section className="bg-white p-6 rounded-lg shadow-md">
+            <h2 className="text-xl font-semibold mb-4 text-gray-800 flex items-center"><Users className="mr-2"/> Utilizadores Registados</h2>
+            <div className="overflow-x-auto">
+                <table className="min-w-full divide-y divide-gray-200">
+                    <thead className="bg-gray-50">
+                        <tr><th className="px-4 py-3 text-left text-xs font-medium uppercase">Nome</th><th className="px-4 py-3 text-left text-xs font-medium uppercase">Matrícula</th><th className="px-4 py-3 text-left text-xs font-medium uppercase">Tipo</th><th className="px-4 py-3 text-left text-xs font-medium uppercase">Ações</th></tr>
+                    </thead>
+                    <tbody className="bg-white divide-y divide-gray-200">
+                        {loadingUsers ? (<tr><td colSpan="4" className="text-center py-4">A carregar...</td></tr>) : (
+                            users.map(user => (
+                                <tr key={user.id}>
+                                    <td className="px-4 py-3 text-sm">{user.nome}</td><td className="px-4 py-3 text-sm">{user.matricula}</td><td className="px-4 py-3 text-sm">{user.tipo}</td>
+                                    <td className="px-4 py-3 text-sm space-x-2">
+                                        <button onClick={() => setEditingUser(user)} className="text-yellow-600 hover:text-yellow-800"><Edit2 size={18}/></button>
+                                        {user.id !== '12937' && <button onClick={() => handleDeleteUser(user)} className="text-red-600 hover:text-red-800"><Trash2 size={18}/></button>}
+                                    </td>
+                                </tr>
+                            ))
+                        )}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        {editingUser && (
+            <div className="fixed inset-0 bg-black bg-opacity-50 flex justify-center items-center z-50">
+                <div className="bg-white p-6 rounded-lg shadow-xl w-full max-w-md">
+                    <h3 className="text-lg font-semibold mb-4">Editar Utilizador</h3>
+                    <form onSubmit={handleUpdateUser}>
+                        <div className="space-y-4">
+                            <div><label className="block text-sm">Nome</label><input name="nome" value={editingUser.nome} onChange={handleEditUserChange} className="mt-1 p-2 w-full border rounded"/></div>
+                            <div><label className="block text-sm">Tipo</label>
+                                <select name="tipo" value={editingUser.tipo} onChange={handleEditUserChange} className="mt-1 p-2 w-full border rounded">
+                                    <option value="Consulta">Consulta</option><option value="Padrão">Padrão</option><option value="Administrador">Administrador</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div className="mt-6 flex justify-end space-x-3">
+                            <button type="button" onClick={() => setEditingUser(null)} className="px-4 py-2 bg-gray-200 rounded">Cancelar</button>
+                            <button type="submit" className="px-4 py-2 bg-blue-600 text-white rounded">Salvar</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        )}
+      </div>
+    );
+}
+
+function AuditLogViewer() {
+    const [logs, setLogs] = useState([]);
+    const [loadingLogs, setLoadingLogs] = useState(true);
+    useEffect(() => {
+        if (!db) return;
+        const logsRef = db.collection(`artifacts/${appId}/public/data/audit_logs`);
+        const q = logsRef.orderBy('timestamp', 'desc');
+        const unsubscribe = q.onSnapshot((snapshot) => {
+            setLogs(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+            setLoadingLogs(false);
+        }, () => { showToast("Erro ao carregar log de alterações.", "error"); setLoadingLogs(false); });
+        return () => unsubscribe();
+    }, []);
+
+    return (
+        <section className="bg-white p-6 rounded-lg shadow-md">
+            <h2 className="text-xl font-semibold mb-4 text-gray-800 flex items-center"><FileText className="mr-2"/> Log de Alterações do Sistema</h2>
+            <div className="overflow-x-auto">
+                <table className="min-w-full divide-y divide-gray-200">
+                    <thead className="bg-gray-50">
+                        <tr><th className="px-4 py-3 text-left text-xs font-medium uppercase">Data/Hora</th><th className="px-4 py-3 text-left text-xs font-medium uppercase">Autor</th><th className="px-4 py-3 text-left text-xs font-medium uppercase">Ação</th><th className="px-4 py-3 text-left text-xs font-medium uppercase">Detalhes</th></tr>
+                    </thead>
+                    <tbody className="bg-white divide-y divide-gray-200">
+                        {loadingLogs ? (<tr><td colSpan="4" className="text-center py-4">A carregar...</td></tr>) : logs.length === 0 ? (<tr><td colSpan="4" className="text-center py-4">Nenhum registo.</td></tr>) : (
+                            logs.map(log => (
+                                <tr key={log.id}>
+                                    <td className="px-4 py-3 text-sm text-gray-500">{log.timestamp.toDate().toLocaleString('pt-BR')}</td>
+                                    <td className="px-4 py-3 text-sm">{log.author.nome} ({log.author.matricula})</td>
+                                    <td className="px-4 py-3 text-sm font-semibold">{log.action}</td>
+                                    <td className="px-4 py-3 text-sm text-gray-600">{log.details}</td>
+                                </tr>
+                            ))
+                        )}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    );
+}
+
+function DashboardPage() {
+    const { currentUser, logout, criarUtilizadoresIniciaisSeNaoExistirem } = useAuth();
+    const [activeTab, setActiveTab] = useState('veiculos');
+    return (
+        <div className="p-4 md:p-6 bg-gray-100 min-h-screen">
+            <header className="flex flex-col md:flex-row justify-between items-center mb-6 pb-4 border-b">
+                <div className="mb-4 md:mb-0 text-center md:text-left"><h1 className="text-2xl md:text-3xl font-bold text-blue-700">Veículos Abandono Itapema</h1><p className="text-sm text-gray-600">Bem-vindo, <span className="font-semibold">{currentUser.nome || 'Utilizador'}</span> ({currentUser.tipo})</p></div>
+                <button onClick={logout} className="flex items-center px-4 py-2 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded-md shadow-sm"><LogOut size={16} className="mr-2" />Sair</button>
+            </header>
+            <div className="mb-6 flex border-b flex-wrap">
+                <button onClick={() => setActiveTab('veiculos')} className={`px-4 py-2 font-medium text-sm flex items-center ${activeTab === 'veiculos' ? 'border-b-2 border-blue-600 text-blue-600' : 'text-gray-500 hover:text-blue-600'}`}><Car size={16} className="mr-2" /> Veículos</button>
+                {currentUser.tipo === 'Administrador' && (<>
+                    <button onClick={() => setActiveTab('usuarios')} className={`px-4 py-2 font-medium text-sm flex items-center ${activeTab === 'usuarios' ? 'border-b-2 border-blue-600 text-blue-600' : 'text-gray-500 hover:text-blue-600'}`}><UserCog size={16} className="mr-2" /> Utilizadores</button>
+                    <button onClick={() => setActiveTab('logs')} className={`px-4 py-2 font-medium text-sm flex items-center ${activeTab === 'logs' ? 'border-b-2 border-blue-600 text-blue-600' : 'text-gray-500 hover:text-blue-600'}`}><FileText size={16} className="mr-2" /> Log de Alterações</button>
+                    <button onClick={criarUtilizadoresIniciaisSeNaoExistirem} className="ml-auto px-4 py-2 font-medium text-sm flex items-center text-purple-600 hover:text-purple-800"><Users size={16} className="mr-2"/>Criar Utilizadores Iniciais</button>
+                </>)}
+            </div>
+            <main>
+                {activeTab === 'veiculos' && <VehicleManagement currentUser={currentUser} />}
+                {activeTab === 'usuarios' && currentUser.tipo === 'Administrador' && <UserManagement currentUser={currentUser} />}
+                {activeTab === 'logs' && currentUser.tipo === 'Administrador' && <AuditLogViewer />}
+            </main>
+        </div>
+    );
+}
+
+// --- APP RAÍZ ---
+function App() {
+  if (firebaseInitializationError) return <ErrorScreen message="Erro Crítico de Configuração" details={firebaseInitializationError} />;
+  return <AuthProvider><AppContent /></AuthProvider>;
+}
+function AppContent() {
+  const { currentUser, loading } = useAuth();
+  if (loading) return <LoadingScreen />;
+  return currentUser ? <DashboardPage /> : <LoginPage />;
+}
+
+const container = document.getElementById('root');
+const root = ReactDOM.createRoot(container);
+root.render(<App />);
 
     </script>
 </body>
