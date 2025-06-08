@@ -401,9 +401,9 @@ function UserManagement({ currentUser }) {
 
     useEffect(() => {
         if (!db) return;
-        const usersCollectionRef = collection(db, `artifacts/${appId}/public/data/users`);
-        const q = query(usersCollectionRef, orderBy("nome"));
-        const unsubscribe = onSnapshot(q, (snapshot) => {
+        const usersCollectionRef = db.collection(`artifacts/${appId}/public/data/users`);
+        const q = usersCollectionRef.orderBy("nome");
+        const unsubscribe = q.onSnapshot((snapshot) => {
             setUsers(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
             setLoadingUsers(false);
         }, () => { showToast("Erro ao carregar utilizadores.", "error"); setLoadingUsers(false); });
@@ -426,11 +426,11 @@ function UserManagement({ currentUser }) {
         if (!matricula || !nome || !senha || !tipo) { showToast("Todos os campos são obrigatórios.", "error"); return; }
         if (matricula.length !== 5 || !/^\d+$/.test(matricula)) { showToast("A matrícula deve conter 5 dígitos.", "error"); return; }
 
-        const userDocRef = doc(db, `artifacts/${appId}/public/data/users`, matricula);
+        const userDocRef = db.collection(`artifacts/${appId}/public/data/users`).doc(matricula);
         try {
-            const docSnap = await getDoc(userDocRef);
-            if (docSnap.exists()) { showToast("Esta matrícula já está registada.", "error"); return; }
-            await setDoc(userDocRef, { ...newUser, dataCriacao: Timestamp.now() });
+            const docSnap = await userDocRef.get();
+            if (docSnap.exists) { showToast("Esta matrícula já está registada.", "error"); return; }
+            await userDocRef.set({ ...newUser, dataCriacao: firebase.firestore.FieldValue.serverTimestamp() });
             await logAction("UTILIZADOR CRIADO", `Matrícula: ${matricula}, Nome: ${nome}, Tipo: ${tipo}`, currentUser);
             showToast("Utilizador adicionado com sucesso!", "success");
             setNewUser({ matricula: '', nome: '', senha: '', tipo: 'Consulta', aprovado: true });
@@ -441,9 +441,9 @@ function UserManagement({ currentUser }) {
         e.preventDefault();
         if (!editingUser) return;
         const { nome, tipo } = editingUser;
-        const userDocRef = doc(db, `artifacts/${appId}/public/data/users`, editingUser.id);
+        const userDocRef = db.collection(`artifacts/${appId}/public/data/users`).doc(editingUser.id);
         try {
-            await updateDoc(userDocRef, { nome, tipo });
+            await userDocRef.update({ nome, tipo });
             await logAction("UTILIZADOR ATUALIZADO", `Utilizador: ${nome} (${editingUser.id})`, currentUser);
             showToast("Utilizador atualizado com sucesso!", "success");
             setEditingUser(null);
@@ -452,9 +452,9 @@ function UserManagement({ currentUser }) {
 
     const handleDeleteUser = async (user) => {
         if (user.id === '12937') { showToast("Não pode excluir o admin.", "error"); return; }
-        const userDocRef = doc(db, `artifacts/${appId}/public/data/users`, user.id);
+        const userDocRef = db.collection(`artifacts/${appId}/public/data/users`).doc(user.id);
         try {
-            await deleteDoc(userDocRef);
+            await userDocRef.delete();
             await logAction("UTILIZADOR EXCLUÍDO", `Utilizador: ${user.nome} (${user.id})`, currentUser);
             showToast("Utilizador excluído.", "success");
         } catch (error) { showToast("Erro ao excluir utilizador.", "error"); }
@@ -530,9 +530,9 @@ function AuditLogViewer() {
     const [loadingLogs, setLoadingLogs] = useState(true);
     useEffect(() => {
         if (!db) return;
-        const logsRef = collection(db, `artifacts/${appId}/public/data/audit_logs`);
-        const q = query(logsRef, orderBy('timestamp', 'desc'));
-        const unsubscribe = onSnapshot(q, (snapshot) => {
+        const logsRef = db.collection(`artifacts/${appId}/public/data/audit_logs`);
+        const q = logsRef.orderBy('timestamp', 'desc');
+        const unsubscribe = q.onSnapshot((snapshot) => {
             setLogs(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
             setLoadingLogs(false);
         }, () => { showToast("Erro ao carregar log de alterações.", "error"); setLoadingLogs(false); });
@@ -592,7 +592,7 @@ function DashboardPage() {
 }
 
 // --- APP RAÍZ ---
-export default function App() {
+function App() {
   if (firebaseInitializationError) return <ErrorScreen message="Erro Crítico de Configuração" details={firebaseInitializationError} />;
   return <AuthProvider><AppContent /></AuthProvider>;
 }
@@ -601,3 +601,9 @@ function AppContent() {
   if (loading) return <LoadingScreen />;
   return currentUser ? <DashboardPage /> : <LoginPage />;
 }
+
+ReactDOM.render(<App />, document.getElementById('root'));
+
+    </script>
+</body>
+</html>
